@@ -7,6 +7,7 @@ data
 models
 submissions
 wandb
+src/models
 notebooks/*.ipynb
 .cache
 **/__pycache__
