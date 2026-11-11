@@ -73,10 +73,11 @@ def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_f
     """
     model.train()
     total_loss = 0.0
+
     indices = torch.randperm(len(X), generator=generator)
+
     for start in range(0, len(X), batch_size):
-        end = start + batch_size
-        batch_indices = indices[start:end]
+        batch_indices = indices[start:start + batch_size]
         X_batch = X[batch_indices]
         y_batch = y[batch_indices]
 
@@ -86,11 +87,9 @@ def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_f
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * len(batch_indices)
 
-    mean_loss = total_loss / (len(X) // batch_size)
-
-    return mean_loss
+    return total_loss / len(X)
 
 
 
@@ -125,20 +124,32 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
               device: str | None = None, tags: list[str] | None = None, log=print) -> dict:
     """Train on the pixel rows train_idx, validate on val_idx after every epoch, log everything.
 
-    `X` is the pixel table, one row per row of `df`. Returns the history, the
-    validation predictions after the first and the last epoch, the trained
-    model, the checkpoint path and the W&B run page.
+    A share of the training groups is set aside as an early-stopping set; the
+    weights of the epoch that scores best there are kept, and validation is
+    reported for those weights. Validation never takes part in the choice.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(cfg["seed"])
     tr = cfg["train"]
 
+    # ES: set aside whole training groups, cut the same way as validation and test
+    groups = df[cfg["split"]["group_column"]].to_numpy()[train_idx]
+    unique = np.unique(groups)
+    rng = np.random.default_rng(cfg["split"]["seed"])          # split seed: the model seed must not move it
+    es_groups = rng.choice(unique, size=max(1, round(tr["es_fraction"] * len(unique))), replace=False)
+    in_es = np.isin(groups, es_groups)
+    es_idx, train_idx = train_idx[in_es], train_idx[~in_es]
+
     scaler = Standardiser().fit(X[train_idx])
     X_tr = to_tensor(scaler.transform(X[train_idx]), device)
     X_va = to_tensor(scaler.transform(X[val_idx]), device)
+    X_es = to_tensor(scaler.transform(X[es_idx]), device)                          # ES
     y_tr = to_tensor(df[config.TARGET].to_numpy()[train_idx], device)
     y_va = df[config.TARGET].to_numpy()[val_idx]
+    y_es = df[config.TARGET].to_numpy()[es_idx]                                    # ES
     ok = df["eval_ok"].to_numpy()[val_idx] == 1
+    ok_es = df["eval_ok"].to_numpy()[es_idx] == 1                                  # ES
+    assert ok_es.any(), "no scoreable rows in the early-stopping set"             # ES
 
     model = MLP(in_dim=X.shape[1], hidden=list(cfg["model"]["hidden"]), dropout=cfg["model"]["dropout"],
                 prior=float(y_tr.mean())).to(device)
@@ -148,33 +159,44 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
 
     tracking.init_run(cfg, tags=tags)
     history, snapshots = [], {}
-    log(f"{cfg['name']}: {len(train_idx)} train / {len(val_idx)} val rows, {X.shape[1]} inputs, "
-        f"{sum(p.numel() for p in model.parameters()):,} parameters, {device}")
+    best_es, best_epoch, best_state = float("inf"), 0, None                        # ES
+    log(f"{cfg['name']}: {len(train_idx)} train / {len(es_idx)} early-stop / {len(val_idx)} val rows, "
+        f"{X.shape[1]} inputs, {sum(p.numel() for p in model.parameters()):,} parameters, {device}")
     for epoch in range(1, tr["epochs"] + 1):
         t0 = time.time()
         loss = train_epoch(model, optimizer, loss_fn, X_tr, y_tr, tr["batch_size"], generator)
         val = validate(model, X_va, y_va, ok)
+        es = validate(model, X_es, y_es, ok_es)                                    # ES
+        if es < best_es:                                                           # ES: chosen on ES only
+            best_es, best_epoch = es, epoch
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         train_eval = rmse(y_tr.cpu().numpy(), predict(model, X_tr))   # dropout off, as in validation
-        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "val_rmse": val,
+        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "es_rmse": es, "val_rmse": val,
                "seconds": time.time() - t0}
         history.append(row)
-        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "val_rmse": val}, step=epoch)
+        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "es_rmse": es, "val_rmse": val},
+                             step=epoch)
         if epoch in (1, tr["epochs"]) or epoch % tr.get("log_every", 10) == 0:
-            log(f"epoch {epoch:3d}  train loss {loss:.4f}  train RMSE {train_eval:.4f}  val RMSE {val:.4f}")
+            log(f"epoch {epoch:3d}  train loss {loss:.4f}  train RMSE {train_eval:.4f}  "
+                f"ES RMSE {es:.4f}  val RMSE {val:.4f}")
         if epoch in (1, tr["epochs"]):
             snapshots[epoch] = predict(model, X_va)
 
+    model.load_state_dict(best_state)                                              # ES: back to the best epoch
+    best_val = validate(model, X_va, y_va, ok)                                     # ES: the reported number
+    log(f"best epoch {best_epoch} (ES RMSE {best_es:.4f}) -> val RMSE {best_val:.4f}")
+
     ckpt = config.ROOT / "models" / f"{cfg['name']}.pt"
     ckpt.parent.mkdir(exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "config": cfg, "in_dim": X.shape[1],
+    torch.save({"state_dict": model.state_dict(), "config": cfg, "in_dim": X.shape[1], "best_epoch": best_epoch,
                 "scaler_mean": scaler.mean, "scaler_scale": scaler.scale}, ckpt)
-    tracking.log_checkpoint(ckpt, cfg["name"], {"val_rmse": history[-1]["val_rmse"]})
-    tracking.log_metrics({"final_val_rmse": history[-1]["val_rmse"]})
+    tracking.log_checkpoint(ckpt, cfg["name"], {"val_rmse": best_val})            # ES
+    tracking.log_metrics({"final_val_rmse": best_val, "best_epoch": best_epoch})  # ES
     url = tracking.run_url()
     tracking.finish()
-    return {"history": pd.DataFrame(history), "val_pred": snapshots[tr["epochs"]], "snapshots": snapshots,
-            "model": model, "checkpoint": ckpt, "url": url, "val_index": val_idx, "ok": ok}
-
+    return {"history": pd.DataFrame(history), "val_pred": predict(model, X_va), "snapshots": snapshots,  # ES
+            "model": model, "checkpoint": ckpt, "url": url, "val_index": val_idx, "ok": ok,
+            "best_epoch": best_epoch, "best_val_rmse": best_val}    
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train the MLP from a config")
