@@ -75,6 +75,27 @@ def tile_dark_max(gray: np.ndarray, threshold: int = 64) -> float:
     """The darkest tile. A shadow across one corner shows here, not in the whole-frame fraction."""
     return float(max((t < threshold).mean() for t in _tiles(gray)))
 
+def center_border_sharpness_ratio(gray: np.ndarray) -> float:
+    """Compare center sharpness to background sharpness.
+
+    The inner 2x2 tiles approximate the subject, while the outer
+    12 tiles approximate the background.
+
+    A ratio > 1 means the center is sharper than the background.
+    A ratio < 1 means the background is sharper than the center.
+    """
+    vals = np.array([
+        laplacian_variance(t) for t in _tiles(gray)
+    ]).reshape(GRID, GRID)
+
+    center = vals[1:-1, 1:-1]
+    border = np.concatenate([
+        vals[0, :], vals[-1, :],
+        vals[1:-1, 0], vals[1:-1, -1]
+    ])
+
+    return float(center.mean() / (border.mean() + 1e-8))
+
 
 FEATURES = {
     "lap_var": laplacian_variance,
@@ -84,6 +105,7 @@ FEATURES = {
     "bright_frac": bright_fraction,
     "tile_lapvar_min": tile_lapvar_min,
     "tile_dark_max": tile_dark_max,
+    "center_border_sharpness_ratio": center_border_sharpness_ratio
 }
 
 
